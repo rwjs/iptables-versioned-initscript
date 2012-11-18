@@ -31,6 +31,7 @@ VERSION_LIMIT=30
 
 ####################### Clean variables and environment ######################
 
+[[ $UID -eq 0 ]] || (echo "Must be run as root!" >&2 ; exit 1)
 mkdir -p $RULES_DIR
 [[ $RULES_DIR =~ /$ ]] && RULES_DIR="$(echo $RULES_DIR | sed 's/\/$//')"
 [[ $RULES_FILE =~ ^/ ]] && RULES_FILE="$(echo $RULES_FILE | sed 's/^\///')"
@@ -72,10 +73,9 @@ function rotator
 
 function start
 {
-	clearall
-
 	if [[ -e "$RULES_DIR/$RULES_FILE" ]]
 	then
+		clearall
 		iptables-restore < "$RULES_DIR/$RULES_FILE"
 	fi
 }
@@ -116,7 +116,7 @@ case "$1" in
 		clearall
 		;;
 	restart)
-		stop
+		save
 		start
 		;;
 	status)
