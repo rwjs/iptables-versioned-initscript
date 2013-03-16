@@ -1,12 +1,15 @@
 #!/bin/bash
 
+HELPTEXT='Usage: '"$0"' [start|stop|status|restart|save|revert {n}|rollback {n}|daemon-start|daemon-stop|daemon-time {n}]'
+
 ##############################################################################
 #
 # NAME:
 #	iptables-versioned-initscript
 #
 # SYNOPSIS:
-#	/etc/init.d/iptables [start|stop|restart|status|save|revert {n}|rollback {n}]
+#       /etc/init.d/iptables [start|stop|status|restart|save|revert {n}|rollback {n}|daemon-start|daemon-stop|daemon-time {n}]
+#
 #
 # DESCRIPTION:
 #	As Debian seems to have depreciated the init script for iptables,
@@ -23,20 +26,34 @@
 ################################ Set defaults ################################
 
 # Directory to store the rules
-RULES_DIR="/var/lib/iptables"
+RULES_DIR="/var/run/iptables"
+
 # The 'active' rules file
 RULES_FILE="iptables.rules"
+
+# Use a daemon
+DAEMON_ENABLED=0
+
+# The daemon script
+DAEMON_FILE='/usr/sbin/iptables-rollbackd.sh'
+
+# The daemon PID file
+DAEMON_PID_FILE="$RULES_DIR"'/iptables-rollbackd.pid'
+
+# How often (in seconds) the daemon repolls before requiring a commit
+DAEMON_TIME=30
+
 # The maximum number of versions to store
 VERSION_LIMIT=30
 
 ####################### Clean variables and environment ######################
 
-[[ $UID -eq 0 ]] || (echo "Must be run as root!" >&2 ; exit 1)
+[[ $UID -eq 0 ]] || { echo 'Must be run as root - dying.' >&2 ; exit 1 ; }
 mkdir -p $RULES_DIR
 [[ $RULES_DIR =~ /$ ]] && RULES_DIR="$(echo $RULES_DIR | sed 's/\/$//')"
 [[ $RULES_FILE =~ ^/ ]] && RULES_FILE="$(echo $RULES_FILE | sed 's/^\///')"
 VERSION_LIMIT=$(echo "$VERSION_LIMIT" | sed 's/^0*//' | tr -cd '0-9' ; echo)
-[[ VERSION_LIMIT" =~ [0-9]*[1-9]+ ]] || VERSION_LIMIT=0
+[[ "$VERSION_LIMIT" =~ [0-9]*[1-9]+ ]] || VERSION_LIMIT=0
 
 ############################## Define functions ##############################
 
@@ -75,6 +92,7 @@ function start
 {
 	if [[ -e "$RULES_DIR/$RULES_FILE" ]]
 	then
+		echo "Reloading rules.."
 		clearall
 		iptables-restore < "$RULES_DIR/$RULES_FILE"
 	fi
@@ -100,12 +118,67 @@ function rollback
 {
 	[[ $1 =~ ^[0-9]+$ && $1 -gt 0 ]] && vers=$1 || vers=1
 	mv "$RULES_DIR/$RULES_FILE.$vers" "$RULES_DIR/$RULES_FILE"
-	[[ "$vers" -eq 1 ]] && rm -f $RULES_DIR/$RULES_FILE.1 || rm -f $RULES_DIR/$RULES_FILE.[1-$vers]
-	rotator "$[ $vers + 1]" -$vers -1
+	[[ "$vers" -eq 1 ]] && rm -f "$RULES_DIR/$RULES_FILE.1" || rm -f "$RULES_DIR/$RULES_FILE.$[1-$vers]"
+	rotator "$[ $vers + 1 ]" - $[ $vers - 1 ]
 	echo iptables-restore < "$RULES_DIR/$RULES_FILE"
 }
 
+function daemon_time
+{
+	[[ $? -lt 1 ]] || { echo 'Please specify a new timeout!' >&2 ; exit 1 ; }
+	[[ "$1" =~ ^[0-9]+$ ]] || { echo "Timeout must be numeric!" >&2 ; exit 1 ; }
+	[[ -w $0 ]] || chmod u+w $0 || { echo 'This script (\`$0\`) is not writable - please rectify!' >&2 ; exit 1 ; }
+
+	DAEMON_TIME=$1
+	sed -i '/^[\t ]*DAEMON_TIME=/s/^.*$/DAEMON_TIME='"$2"'/' "$DAEMON_FILE"
+} 
+
+function daemon_disable
+{
+	[[ -w $0 ]] || { echo "This script (\`$0\`) is not writable - please rectify!" >&2 ; exit 1 ; }
+
+	DAEMON_ENABLED=0
+	grep -Eq '^DAEMON_ENABLED=' $0 || echo 'DAEMON_ENABLED=1' >> $0
+	sed -i '/^[\t ]*DAEMON_ENABLED/s/^.*$/DAEMON_ENABLED=0/'
+	daemon-stop
+}
+
+function daemon_enable
+{
+	[[ -w $0 ]] || { echo "This script (\`$0\`) is not writable - please rectify!" >&2 ; exit 1 ; }
+
+	DAEMON_ENABLED=1
+	grep -Eq '^DAEMON_ENABLED=' $0 || echo 'DAEMON_ENABLED=1' >> $0
+	sed -i '/^[\t ]*DAEMON_ENABLED/s/^.*$/DAEMON_ENABLED=1/'
+	daemon-start
+}
+
+function daemon_start
+{
+	echo 'Starting daemon..'
+	bash $DAEMON_FILE &
+	disown $(jobs -l | awk '{print $2}')
+}
+
+function daemon_stop
+{
+	echo 'Stopping daemon..'
+	kill $DAEMON_PID
+}
+
+
+if (( DAEMON_ENABLED )) && [[ "$1" != 'daemon-disable' ]]
+then
+	touch "$DAEMON_PID_FILE"
+	if [[ $? -ne 0 ]]
+	then
+		echo 'Could not create PID file for rollback daemon - please either rectify or disable the daemon' >&2
+		exit 1
+	fi
+fi
+
 ################################# Get options ################################
+
 
 case "$1" in
 	start)
@@ -119,6 +192,9 @@ case "$1" in
 		save
 		start
 		;;
+	commit)
+		kill $(cat $DAEMON_PID)
+		;;
 	status)
 		iptables-save
 		;;
@@ -131,8 +207,27 @@ case "$1" in
 	save)
 		save
 		;;
+	daemon-disable)
+		daemon_disable
+		;;
+	daemon-start)
+		daemon_start
+		;;
+	daemon-stop)
+		[[ $# -ge 2 ]] && daemon_time "$2"
+		daemon-stop
+		;;
+	daemon-time)
+		daemon_time "$2"
+		kill $DAEMON_PID
+		daemon_start
+		;;
+	help)
+		echo "$HELPTEXT"
+		exit 0
+		;;
 	*)
-		echo "Usage: $0 {start|stop|status|restart|save|revert {n}|rollback {n}}"
+		echo "$HELPTEXT" >&2
 		exit 1
 		;;
 esac
